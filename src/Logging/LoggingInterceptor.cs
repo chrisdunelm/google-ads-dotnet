@@ -19,6 +19,7 @@ using Grpc.Core.Interceptors;
 using System;
 using System.Linq;
 using System.Reflection;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace Google.Ads.GoogleAds.Logging
@@ -131,6 +132,61 @@ namespace Google.Ads.GoogleAds.Logging
             });
             t.Wait();
             return call;
+        }
+
+        private class LoggingAsyncStreamReader<T> : IAsyncStreamReader<T>
+        {
+            public LoggingAsyncStreamReader(IAsyncStreamReader<T> sr, Action<T> logAction) =>
+                (_sr, _logAction) = (sr, logAction);
+
+            private readonly IAsyncStreamReader<T> _sr;
+            private readonly Action<T> _logAction;
+
+            public T Current
+            {
+                get
+                {
+                    var current = _sr.Current;
+                    if (TraceUtilities.ShouldGenerateRequestLogs())
+                    {
+                        // When a stream item is read, and logging is enabled, take logging action.
+                        _logAction(current);
+                    }
+                    return current;
+                }
+            }
+
+            public Task<bool> MoveNext(CancellationToken cancellationToken) => _sr.MoveNext(cancellationToken);
+
+            public void Dispose() => _sr.Dispose();
+        }
+
+        public override AsyncServerStreamingCall<TResponse> AsyncServerStreamingCall<TRequest, TResponse>(
+            TRequest request, ClientInterceptorContext<TRequest, TResponse> context, AsyncServerStreamingCallContinuation<TRequest, TResponse> continuation)
+        {
+            // Get the underlying server-streaming call.
+            var call = continuation(request, context);
+            // Create the logging interceptor stream-reader.
+            var loggingResponseStream = new LoggingAsyncStreamReader<TResponse>(call.ResponseStream, LogAction);
+            // Return a new server-streaming call with the response-stream replaced with the just-created logging response-stream.
+            return new AsyncServerStreamingCall<TResponse>(loggingResponseStream, call.ResponseHeadersAsync, call.GetStatus, call.GetTrailers, call.Dispose);
+
+            // This method defines what happens when a stream item is read, and logging is enabled.
+            void LogAction(TResponse response)
+            {
+                var logEntry = new LogEntry
+                {
+                    Host = Config.ServerUrl,
+                    Method = context.Method.FullName,
+                    RequestHeaders = context.Options.Headers,
+                    Request = request,
+                    ResponseHeaders = call.ResponseHeadersAsync.Result,
+                    Response = response,
+                    CustomerId = GetCustomerId(request)
+                    // TODO: Other logentry properties that aren't so obvious for how to apply to streaming.
+                };
+                OnLogEventAvailable?.Invoke(this, logEntry);
+            }
         }
 
         /// <summary>
